@@ -11,7 +11,6 @@ colorama>=0.4.4
 tensorboard>=2.5.0
 thop>=0.1.1.post2207130030
 ray>=1.13.0
-protobuf>=3.19.0,<4.0.0
 tabulate>=0.8.10 
 plotly>=4.0.0
 texttable>=0.9.0

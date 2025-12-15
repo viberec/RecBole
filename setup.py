@@ -12,8 +12,8 @@ install_requires = [
     "scipy>=1.6.0",
     "pandas>=1.3.0",
     "tqdm>=4.48.2",
-    "colorlog==4.7.2",
-    "colorama==0.4.4",
+    "colorlog>=4.7.2",
+    "colorama>=0.4.4",
     "scikit_learn>=0.23.2",
     "pyyaml>=5.1.0",
     "tensorboard>=2.5.0",
@@ -23,7 +23,6 @@ install_requires = [
     "texttable>=0.9.0",
     "psutil>=5.9.0",
     "ray>=1.13.0",
-    "protobuf>=3.19.0,<4.0.0",
 ]
 
 setup_requires = []
