@@ -23,6 +23,7 @@ install_requires = [
     "texttable>=0.9.0",
     "psutil>=5.9.0",
     "ray>=1.13.0",
+    "protobuf>=3.19.0,<4.0.0",
 ]
 
 setup_requires = []
