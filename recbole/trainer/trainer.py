@@ -232,7 +232,7 @@ class Trainer(AbstractTrainer):
         if not self.config["single_spec"] and train_data.shuffle:
             train_data.sampler.set_epoch(epoch_idx)
 
-        scaler = amp.GradScaler(enabled=self.enable_scaler)
+        scaler = torch.amp.GradScaler(self.device.type, enabled=self.enable_scaler)
         accumulation_steps = self.config.get("accumulation_steps", 1)
         self.optimizer.zero_grad()
         for batch_idx, interaction in enumerate(iter_data):
