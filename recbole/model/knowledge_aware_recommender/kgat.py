@@ -50,8 +50,16 @@ class Aggregator(nn.Module):
         self.activation = nn.LeakyReLU()
 
     def forward(self, norm_matrix, ego_embeddings):
-        side_embeddings = torch.sparse.mm(norm_matrix, ego_embeddings)
-
+        with torch.autocast(device_type=ego_embeddings.device.type, enabled=False):
+            # Sparse MM is not supported in FP16 on CUDA
+            side_embeddings = torch.sparse.mm(norm_matrix, ego_embeddings.float())
+        
+        # Ensure output is back to original dtype if needed, or let subsequent layers handle mixed precision
+        # Since we broke autocast, side_embeddings is float32. 
+        # But ego_embeddings was likely float16 if autocast was on.
+        # We should cast back to match ego_embeddings type approx or let autocast handle it.
+        # Actually, best is to just perform this op in FP32.
+        
         if self.aggregator_type == "gcn":
             ego_embeddings = self.activation(self.W(ego_embeddings + side_embeddings))
         elif self.aggregator_type == "graphsage":
@@ -156,14 +164,15 @@ class KGAT(KnowledgeRecommender):
                 .astype("float")
             )
             rowsum = np.array(sub_graph.sum(1))
-            d_inv = np.power(rowsum, -1).flatten()
+            with np.errstate(divide='ignore'):
+                d_inv = np.power(rowsum, -1).flatten()
             d_inv[np.isinf(d_inv)] = 0.0
             d_mat_inv = sp.diags(d_inv)
             norm_adj = d_mat_inv.dot(sub_graph).tocoo()
             adj_list.append(norm_adj)
 
         final_adj_matrix = sum(adj_list).tocoo()
-        indices = torch.LongTensor([final_adj_matrix.row, final_adj_matrix.col])
+        indices = torch.LongTensor(np.vstack((final_adj_matrix.row, final_adj_matrix.col)))
         values = torch.FloatTensor(final_adj_matrix.data)
         adj_matrix_tensor = torch.sparse.FloatTensor(indices, values, self.matrix_size)
         return adj_matrix_tensor.to(self.device)
