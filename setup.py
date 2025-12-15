@@ -13,17 +13,17 @@ install_requires = [
     "pandas>=1.3.0",
     "tqdm>=4.48.2",
     "colorlog>=4.7.2",
-    "colorama>=0.4.4",
+    "colorama>=0.4.6",
     "scikit_learn>=0.23.2",
     "pyyaml>=5.1.0",
-    "tensorboard>=2.5.0",
+    # "tensorboard>=2.5.0",
     "thop>=0.1.1.post2207130030",
     "tabulate>=0.8.10",
     "plotly>=4.0.0",
     "texttable>=0.9.0",
     "psutil>=5.9.0",
     "ray>=1.13.0",
-    "protobuf>=3.19.0,<4.0.0",
+    "protobuf>=3.19.0",
 ]
 
 setup_requires = []
