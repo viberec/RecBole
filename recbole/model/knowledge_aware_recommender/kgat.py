@@ -150,11 +150,18 @@ class KGAT(KnowledgeRecommender):
             edge_idxs = self.ckg.filter_edges(
                 lambda edge: edge.data["relation_id"] == rel_type
             )
-            sub_graph = (
-                dgl.edge_subgraph(self.ckg, edge_idxs, relabel_nodes=False)
-                .adj(scipy_fmt="coo")
-                .astype("float")
-            )
+            g = dgl.edge_subgraph(self.ckg, edge_idxs, relabel_nodes=False)
+            try:
+                adj = g.adj(scipy_fmt="coo")
+            except TypeError:
+                adj = g.adjacency_matrix()
+                if adj.is_cuda:
+                    adj = adj.cpu()
+                indices = adj.indices().numpy()
+                values = adj.values().numpy()
+                adj = sp.coo_matrix((values, (indices[0], indices[1])), shape=adj.shape)
+            
+            sub_graph = adj.astype("float")
             rowsum = np.array(sub_graph.sum(1))
             d_inv = np.power(rowsum, -1).flatten()
             d_inv[np.isinf(d_inv)] = 0.0
