@@ -233,9 +233,10 @@ class Trainer(AbstractTrainer):
             train_data.sampler.set_epoch(epoch_idx)
 
         scaler = amp.GradScaler(enabled=self.enable_scaler)
+        accumulation_steps = self.config.get("accumulation_steps", 1)
+        self.optimizer.zero_grad()
         for batch_idx, interaction in enumerate(iter_data):
             interaction = interaction.to(self.device)
-            self.optimizer.zero_grad()
             sync_loss = 0
             if not self.config["single_spec"]:
                 self.set_reduce_hook()
@@ -258,11 +259,13 @@ class Trainer(AbstractTrainer):
                     losses.item() if total_loss is None else total_loss + losses.item()
                 )
             self._check_nan(loss)
-            scaler.scale(loss + sync_loss).backward()
-            if self.clip_grad_norm:
-                clip_grad_norm_(self.model.parameters(), **self.clip_grad_norm)
-            scaler.step(self.optimizer)
-            scaler.update()
+            scaler.scale((loss + sync_loss) / accumulation_steps).backward()
+            if (batch_idx + 1) % accumulation_steps == 0:
+                if self.clip_grad_norm:
+                    clip_grad_norm_(self.model.parameters(), **self.clip_grad_norm)
+                scaler.step(self.optimizer)
+                scaler.update()
+                self.optimizer.zero_grad()
             if self.gpu_available and show_progress:
                 iter_data.set_postfix_str(
                     set_color("GPU RAM: " + get_gpu_usage(self.device), "yellow")
