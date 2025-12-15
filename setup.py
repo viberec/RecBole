@@ -22,7 +22,7 @@ install_requires = [
     "plotly>=4.0.0",
     "texttable>=0.9.0",
     "psutil>=5.9.0",
-    "ray>=1.13.0, <=2.6.3",
+    "ray>=1.13.0",
 ]
 
 setup_requires = []
