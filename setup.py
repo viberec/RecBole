@@ -8,7 +8,7 @@ from setuptools import setup, find_packages
 
 install_requires = [
     # "torch>=1.10.0",
-    "numpy>=1.17.2",
+    "numpy>=2.0.0,<3.0.0",
     "scipy>=1.6.0",
     "pandas>=1.3.0",
     "tqdm>=4.48.2",
@@ -24,6 +24,10 @@ install_requires = [
     "psutil>=5.9.0",
     "ray>=1.13.0",
     "protobuf>=5.29.5",
+    "libraft-cu12>=25.6.0",
+    "pylibraft-cu12>=25.6.0",
+    "rmm-cu12>=25.6.0",
+    "rich<14,>=12.4.4",
 ]
 
 setup_requires = []
