@@ -383,7 +383,7 @@ class HyperTuning(object):
         data_dict = {"valid_score": self.score_list, "params": self.params_list}
         trial_df = pd.DataFrame(data_dict)
         trial_df["trial_number"] = trial_df.index + 1
-        trial_df["trial_number"] = trial_df["trial_number"].astype(dtype=np.str)
+        trial_df["trial_number"] = trial_df["trial_number"].astype(dtype=str)
 
         trace = go.Scatter(
             x=trial_df["trial_number"],
