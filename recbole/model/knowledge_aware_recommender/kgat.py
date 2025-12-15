@@ -152,7 +152,7 @@ class KGAT(KnowledgeRecommender):
             )
             sub_graph = (
                 dgl.edge_subgraph(self.ckg, edge_idxs, relabel_nodes=False)
-                .adjacency_matrix(scipy_fmt="coo")
+                .adj(scipy_fmt="coo")
                 .astype("float")
             )
             rowsum = np.array(sub_graph.sum(1))
