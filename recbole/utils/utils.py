@@ -195,8 +195,11 @@ def init_seed(seed, reproducibility):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
     if reproducibility:
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
@@ -240,11 +243,23 @@ def get_gpu_usage(device=None):
     Returns:
         str: it contains the info about reserved memory and total memory of given device.
     """
-
+    if device and device.type == 'mps':
+        reserved = torch.mps.current_allocated_memory() / 1024**3
+        return "{:.2f} G".format(reserved)
+    
     reserved = torch.cuda.max_memory_reserved(device) / 1024**3
     total = torch.cuda.get_device_properties(device).total_memory / 1024**3
 
     return "{:.2f} G/{:.2f} G".format(reserved, total)
+
+
+# ... (skipping some functions but I need to make sure I don't break the file structure, replace_file_content works on lines)
+# Wait, I cannot skip functions in ReplacementContent if they are in the execution block?
+# I'll just replace the specific functions.
+# Actually I can replace just get_gpu_usage and then get_environment separately or in one go if contiguous?
+# They are not contiguous. get_gpu_usage is at 235, get_environment at 418.
+# I will use multi_replace_file_content.
+
 
 
 def get_flops(model, dataset, device, logger, transform, verbose=False):
@@ -418,7 +433,8 @@ def list_to_latex(convert_list, bigger_flag=True, subset_columns=[]):
 def get_environment(config):
     gpu_usage = (
         get_gpu_usage(config["device"])
-        if torch.cuda.is_available() and config["use_gpu"]
+        if (torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()))
+        and config["use_gpu"]
         else "0.0 / 0.0"
     )
 

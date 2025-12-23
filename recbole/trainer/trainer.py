@@ -123,7 +123,7 @@ class Trainer(AbstractTrainer):
         self.valid_metric = config["valid_metric"].lower()
         self.valid_metric_bigger = config["valid_metric_bigger"]
         self.test_batch_size = config["eval_batch_size"]
-        self.gpu_available = torch.cuda.is_available() and config["use_gpu"]
+        self.gpu_available = (torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())) and config["use_gpu"]
         self.device = config["device"]
         self.checkpoint_dir = config["checkpoint_dir"]
         self.enable_amp = config["enable_amp"]

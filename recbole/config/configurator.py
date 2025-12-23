@@ -487,11 +487,14 @@ class Config(object):
         if "local_rank" not in self.final_config_dict:
             self.final_config_dict["single_spec"] = True
             self.final_config_dict["local_rank"] = 0
-            self.final_config_dict["device"] = (
-                torch.device("cpu")
-                if len(gpu_id) == 0 or not torch.cuda.is_available()
-                else torch.device("cuda")
-            )
+            if len(gpu_id) == 0:
+                self.final_config_dict["device"] = torch.device("cpu")
+            elif torch.cuda.is_available():
+                self.final_config_dict["device"] = torch.device("cuda")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.final_config_dict["device"] = torch.device("mps")
+            else:
+                self.final_config_dict["device"] = torch.device("cpu")
         else:
             assert len(gpu_id.split(",")) >= self.final_config_dict["nproc"]
             torch.distributed.init_process_group(
