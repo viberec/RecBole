@@ -140,19 +140,19 @@ class SASRec(SequentialRecommender):
                 pos_logits = torch.sum(seq_output * pos_emb, dim=-1, keepdim=True)
 
                 # B. Calculate Negative Scores (Heavy - Optimized)
-                # Generate Negatives on GPU
+                # Generate Negatives on GPU (SHARED NEGATIVES)
+                # We sample one set of negatives for the whole batch.
+                # This allows using a single GEMM (MatMul) which is much faster than BMM.
                 neg_items = torch.randint(
                     1, self.n_items,
-                    (batch_size, n_neg),
+                    (n_neg,),
                     device=pos_items.device
                 )
-                neg_emb = self.item_embedding(neg_items)
+                neg_emb = self.item_embedding(neg_items)  # [Neg, Hidden]
 
-                # USE TENSOR CORES: Batch Matrix Multiplication (BMM)
-                # Reshape seq_output to [Batch, Hidden, 1]
-                # [Batch, Neg, Hidden] @ [Batch, Hidden, 1] -> [Batch, Neg, 1]
-                # This is significantly faster than broadcast mul + sum on L4
-                neg_logits = torch.bmm(neg_emb, seq_output.unsqueeze(2)).squeeze(2)
+                # USE TENSOR CORES: General Matrix Multiplication (GEMM)
+                # [Batch, Hidden] @ [Hidden, Neg] -> [Batch, Neg]
+                neg_logits = torch.matmul(seq_output, neg_emb.transpose(0, 1))
 
                 # 3. Combine Scores: [Batch, 1] + [Batch, Neg] -> [Batch, 1+Neg]
                 logits = torch.cat([pos_logits, neg_logits], dim=1)

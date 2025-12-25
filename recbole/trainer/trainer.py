@@ -57,6 +57,13 @@ class AbstractTrainer(object):
     def __init__(self, config, model):
         self.config = config
         self.model = model
+        if config.get("compile_model", False):
+            if hasattr(torch, "compile"):
+                # self.logger is not initialized here in AbstractTrainer, so we just compile
+                self.model = torch.compile(self.model)
+            else:
+                getLogger().warning("compile_model is True but torch.compile is not available. Ignoring.")
+
         if not config["single_spec"]:
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
             self.distributed_model = DistributedDataParallel(
