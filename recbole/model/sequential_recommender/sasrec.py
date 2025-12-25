@@ -26,39 +26,42 @@ from recbole.model.loss import BPRLoss
 class SASRec(SequentialRecommender):
     r"""
     SASRec is the first sequential recommender based on self-attentive mechanism.
-
-    NOTE:
-        In the author's implementation, the Point-Wise Feed-Forward Network (PFFN) is implemented
-        by CNN with 1x1 kernel. In this implementation, we follows the original BERT implementation
-        using Fully Connected Layer to implement the PFFN.
+    
+    OPTIMIZED VERSION:
+    - Uses Native PyTorch Transformer (FlashAttention support)
+    - Implements Full-Sequence Training (trains on all timesteps, not just the last)
+    - Supports BPR, Sampled Softmax (Shared Negatives), and Full Softmax
     """
 
     def __init__(self, config, dataset):
         super(SASRec, self).__init__(config, dataset)
 
-        # load parameters info
+        # 1. Load Parameters
         self.n_layers = config["n_layers"]
         self.n_heads = config["n_heads"]
-        self.hidden_size = config["hidden_size"]  # same as embedding_size
-        self.inner_size = config[
-            "inner_size"
-        ]  # the dimensionality in feed-forward layer
+        self.hidden_size = config["hidden_size"]
+        self.inner_size = config["inner_size"]
         self.hidden_dropout_prob = config["hidden_dropout_prob"]
         self.attn_dropout_prob = config["attn_dropout_prob"]
         self.hidden_act = config["hidden_act"]
         self.layer_norm_eps = config["layer_norm_eps"]
-
         self.initializer_range = config["initializer_range"]
         self.loss_type = config["loss_type"]
+        
+        # Check for custom sampling args, usually found in config or added manually
         self.sample_num = int(
             config.get("custom_train_neg_sample_args", {}).get("sample_num", 0)
         )
 
-        # define layers and loss
+        # 2. Embeddings
         self.item_embedding = nn.Embedding(
             self.n_items, self.hidden_size, padding_idx=0
         )
         self.position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
+
+        # 3. OPTIMIZATION: Native PyTorch Transformer
+        # Replaces RecBole's slow Python implementation.
+        # Triggers FlashAttention on supported GPUs (L4, A100, etc.)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_size,
             nhead=self.n_heads,
@@ -66,8 +69,8 @@ class SASRec(SequentialRecommender):
             dropout=self.hidden_dropout_prob,
             activation=self.hidden_act,
             layer_norm_eps=self.layer_norm_eps,
-            batch_first=True,    # CRITICAL: SASRec data is [Batch, Seq]
-            norm_first=True      # Pre-Norm is generally more stable for deep SASRec
+            batch_first=True,    # CRITICAL: SASRec uses [Batch, Seq]
+            norm_first=True      # Pre-Norm is more stable for deep networks
         )
         self.trm_encoder = nn.TransformerEncoder(
             encoder_layer,
@@ -78,6 +81,7 @@ class SASRec(SequentialRecommender):
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
+        # 4. Loss Functions
         if self.loss_type == "BPR":
             self.loss_fct = BPRLoss()
         elif self.loss_type == "CE":
@@ -85,34 +89,26 @@ class SASRec(SequentialRecommender):
         else:
             raise NotImplementedError("Make sure 'loss_type' in ['BPR', 'CE']!")
         
-        # OPTIMIZATION 1: Pre-compute static Position IDs
-        # We create a buffer [1, max_seq_length] that lives on the GPU.
-        # This prevents creating a new tensor every single forward step.
+        # 5. OPTIMIZATION: Pre-compute Static Buffers
+        # Position IDs: [1, Max_Len]
         self.register_buffer(
             "position_ids",
             torch.arange(self.max_seq_length).unsqueeze(0)
         )
         
-        # OPTIMIZATION 2: Pre-compute Causal Mask (Upper Triangular -inf)
-        # Used for native TransformerEncoder
-        # Shape: [MAX_LEN, MAX_LEN]
+        # Causal Mask (Upper Triangular True)
+        # We use a Boolean mask to enable the fastest FlashAttention kernels.
         causal_mask = torch.triu(
-            torch.full(
-                (self.max_seq_length, self.max_seq_length), 
-                float("-inf")
-            ), 
+            torch.ones(self.max_seq_length, self.max_seq_length), 
             diagonal=1
-        )
+        ).bool()
         self.register_buffer("causal_mask", causal_mask)
 
-        # parameters initialization
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.initializer_range)
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
@@ -133,77 +129,95 @@ class SASRec(SequentialRecommender):
         input_emb = self.dropout(input_emb)
 
         # 2. Masking (Native PyTorch Logic)
-        # src_key_padding_mask: [Batch, Seq] -> True where padding (0) exists
         padding_mask = (item_seq == 0)
-
-        # mask: [Seq, Seq] -> Causal mask (prevent peeking ahead)
-        # We slice our pre-computed buffer.
         attn_mask = self.causal_mask[:seq_length, :seq_length]
 
-        # 3. Transformer Pass (Fused Kernel)
-        # This is where the speedup happens.
+        # 3. Transformer Pass
+        # Returns [Batch, Seq, Hidden] - THE FULL SEQUENCE
+        # We do NOT gather the last item here anymore.
         output = self.trm_encoder(
             src=input_emb, 
             mask=attn_mask, 
             src_key_padding_mask=padding_mask
         )
         
-        # 4. Gather Last Item
-        # Optimized indexing for batch gathering
-        batch_indices = torch.arange(output.size(0), device=output.device)
-        output = output[batch_indices, item_seq_len - 1]
-        
-        return output  # [B H]
+        return output
 
     def calculate_loss(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        
+        # Get full sequence output: [Batch, Seq_Len, Hidden]
         seq_output = self.forward(item_seq, item_seq_len)
-        pos_items = interaction[self.POS_ITEM_ID]
+        
+        # Target: The 'pos_items' from RecBole are typically shifted (next item)
+        pos_items = interaction[self.POS_ITEM_ID] # [Batch, Seq_Len]
+
+        # ----------------------------------------------------------------------
+        # OPTIMIZATION: Full Sequence Training (Convergence Speedup)
+        # We flatten the batch and sequence dimensions to train on EVERY valid timestep.
+        # ----------------------------------------------------------------------
+        
+        # 1. Identify valid steps (Mask out padding)
+        mask = (pos_items != 0)
+        
+        # 2. Flatten: [Total_Valid_Tokens, Hidden]
+        seq_output = seq_output[mask]
+        pos_items = pos_items[mask]
+
         if self.loss_type == "BPR":
-            neg_items = interaction[self.NEG_ITEM_ID]
-            pos_items_emb = self.item_embedding(pos_items)
-            neg_items_emb = self.item_embedding(neg_items)
-            pos_score = torch.sum(seq_output * pos_items_emb, dim=-1)  # [B]
-            neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)  # [B]
+            # --- BPR Loss (Optimized) ---
+            # Paper Logic: 1 Negative per Positive
+            # GPU Optimization: Generate negatives on GPU instantly
+            
+            neg_items = torch.randint(
+                1, self.n_items, 
+                (pos_items.size(0),), 
+                device=pos_items.device
+            )
+            
+            pos_emb = self.item_embedding(pos_items)
+            neg_emb = self.item_embedding(neg_items)
+            
+            # Calculate scores (Dot Product)
+            pos_score = torch.sum(seq_output * pos_emb, dim=-1)
+            neg_score = torch.sum(seq_output * neg_emb, dim=-1)
+            
             loss = self.loss_fct(pos_score, neg_score)
             return loss
-        else:  # self.loss_type = 'CE'
-            if self.sample_num > 0:
-                n_neg = self.sample_num
-                batch_size = pos_items.size(0)
 
-                # A. Calculate Positive Scores (Cheap)
+        elif self.loss_type == 'CE':
+            if self.sample_num > 0:
+                # --- Sampled Softmax (Shared Negatives / GEMM) ---
+                # Optimization: 1 Shared Pool for the whole batch
+                
+                n_neg = self.sample_num
+                batch_size = pos_items.size(0) # Effectively Total_Valid_Tokens
+
+                # A. Positive Scores
                 pos_emb = self.item_embedding(pos_items)
-                # Dot Product: [Batch, H] * [Batch, H] -> Sum -> [Batch, 1]
                 pos_logits = torch.sum(seq_output * pos_emb, dim=-1, keepdim=True)
 
-                # B. Calculate Negative Scores (Heavy - Optimized)
-                # Generate Negatives on GPU (SHARED NEGATIVES)
-                # We sample one set of negatives for the whole batch.
-                # This allows using a single GEMM (MatMul) which is much faster than BMM.
+                # B. Negative Scores (GEMM)
                 neg_items = torch.randint(
                     1, self.n_items,
                     (n_neg,),
                     device=pos_items.device
                 )
-                neg_emb = self.item_embedding(neg_items)  # [Neg, Hidden]
-
-                # USE TENSOR CORES: General Matrix Multiplication (GEMM)
-                # [Batch, Hidden] @ [Hidden, Neg] -> [Batch, Neg]
+                neg_emb = self.item_embedding(neg_items)
                 neg_logits = torch.matmul(seq_output, neg_emb.transpose(0, 1))
 
-                # 3. Combine Scores: [Batch, 1] + [Batch, Neg] -> [Batch, 1+Neg]
+                # C. Combine & Loss
                 logits = torch.cat([pos_logits, neg_logits], dim=1)
-
-                # 4. Target is always index 0
                 targets = torch.zeros(
                     batch_size, dtype=torch.long, device=pos_items.device
                 )
-
                 loss = self.loss_fct(logits, targets)
                 return loss
+            
             else:
+                # --- Full Softmax (Exact) ---
+                # Heavy computation: [Total_Valid_Tokens, N_Items]
                 test_item_emb = self.item_embedding.weight
                 logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
                 loss = self.loss_fct(logits, pos_items)
@@ -213,15 +227,30 @@ class SASRec(SequentialRecommender):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         test_item = interaction[self.ITEM_ID]
+        
+        # Get full sequence
         seq_output = self.forward(item_seq, item_seq_len)
+        
+        # Gather LAST item only for prediction
+        # [Batch, Hidden]
+        batch_indices = torch.arange(seq_output.size(0), device=seq_output.device)
+        seq_output = seq_output[batch_indices, item_seq_len - 1]
+        
         test_item_emb = self.item_embedding(test_item)
-        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)  # [B]
+        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)
         return scores
 
     def full_sort_predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        
+        # Get full sequence
         seq_output = self.forward(item_seq, item_seq_len)
+        
+        # Gather LAST item only for prediction
+        batch_indices = torch.arange(seq_output.size(0), device=seq_output.device)
+        seq_output = seq_output[batch_indices, item_seq_len - 1]
+        
         test_items_emb = self.item_embedding.weight
-        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B n_items]
+        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))
         return scores
