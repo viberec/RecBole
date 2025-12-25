@@ -50,6 +50,9 @@ class SASRec(SequentialRecommender):
 
         self.initializer_range = config["initializer_range"]
         self.loss_type = config["loss_type"]
+        self.sample_num = int(
+            config.get("custom_train_neg_sample_args", {}).get("sample_num", 0)
+        )
 
         # define layers and loss
         self.item_embedding = nn.Embedding(
@@ -127,10 +130,43 @@ class SASRec(SequentialRecommender):
             loss = self.loss_fct(pos_score, neg_score)
             return loss
         else:  # self.loss_type = 'CE'
-            test_item_emb = self.item_embedding.weight
-            logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
-            loss = self.loss_fct(logits, pos_items)
-            return loss
+            if self.sample_num > 0:
+                n_neg = self.sample_num
+                batch_size = pos_items.size(0)
+
+                # 1. GENERATE ON GPU: Instant random integers
+                # We sample from [1, n_items). Index 0 is padding.
+                # This avoids all CPU-to-GPU copy overhead.
+                neg_items = torch.randint(
+                    1, self.n_items,
+                    (batch_size, n_neg),
+                    device=pos_items.device
+                )
+
+                # 2. Combine Positive (1) + Negatives (N) -> Candidates (N+1)
+                pos_items_unsqueeze = pos_items.unsqueeze(1)
+                candidates = torch.cat([pos_items_unsqueeze, neg_items], dim=1)
+
+                # 3. Get embeddings for just these candidates
+                candidate_emb = self.item_embedding(candidates)  # [Batch, N+1, Hidden]
+
+                # 4. Calculate logits (Dot Product)
+                seq_output_unsqueeze = seq_output.unsqueeze(1)
+                # [Batch, 1, Hidden] * [Batch, N+1, Hidden] -> Sum -> [Batch, N+1]
+                logits = (seq_output_unsqueeze * candidate_emb).sum(dim=-1)
+
+                # 5. Target is always index 0 (The Positive Item)
+                targets = torch.zeros(
+                    batch_size, dtype=torch.long, device=pos_items.device
+                )
+
+                loss = self.loss_fct(logits, targets)
+                return loss
+            else:
+                test_item_emb = self.item_embedding.weight
+                logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
+                loss = self.loss_fct(logits, pos_items)
+                return loss
 
     def predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
