@@ -57,7 +57,7 @@ class AbstractTrainer(object):
     def __init__(self, config, model):
         self.config = config
         self.model = model
-        if config.get("compile_model", False):
+        if config.get("compile_model", True):
             if hasattr(torch, "compile"):
                 # self.logger is not initialized here in AbstractTrainer, so we just compile
                 self.model = torch.compile(self.model)
