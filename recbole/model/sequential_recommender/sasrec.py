@@ -148,72 +148,101 @@ class SASRec(SequentialRecommender):
             src_key_padding_mask=padding_mask
         )
         
-        # 4. Gather Last Item
-        # Optimized indexing for batch gathering
-        batch_indices = torch.arange(output.size(0), device=output.device)
-        output = output[batch_indices, item_seq_len - 1]
-        
-        return output  # [B H]
+        # 4. Return Full Sequence
+        # output shape: [Batch, Seq_Len, Hidden]
+        return output
 
     def calculate_loss(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         seq_output = self.forward(item_seq, item_seq_len)
         pos_items = interaction[self.POS_ITEM_ID]
+        
+        # Mask valid items (ignore padding 0)
+        mask = (item_seq != 0) 
+
         if self.loss_type == "BPR":
             neg_items = interaction[self.NEG_ITEM_ID]
-            pos_items_emb = self.item_embedding(pos_items)
-            neg_items_emb = self.item_embedding(neg_items)
-            pos_score = torch.sum(seq_output * pos_items_emb, dim=-1)  # [B]
-            neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)  # [B]
+            
+            # Flatten to [Batch * Valid_Len, Hidden]
+            active_output = seq_output[mask]
+            active_pos_items = pos_items[mask]
+            active_neg_items = neg_items[mask]
+            
+            pos_emb = self.item_embedding(active_pos_items)
+            neg_emb = self.item_embedding(active_neg_items)
+            
+            pos_score = torch.sum(active_output * pos_emb, dim=-1)
+            neg_score = torch.sum(active_output * neg_emb, dim=-1)
+            
             loss = self.loss_fct(pos_score, neg_score)
             return loss
+            
         else:  # self.loss_type = 'CE'
             if self.sample_num > 0:
+                # Custom Sampling - Optimized
+                
+                # 1. Gather only the last valid item for consistency with optimization target? 
+                # OR do we train on every step?
+                # Standard SASRec trains on every step.
+                
+                # Flatten active steps
+                active_output = seq_output[mask] # [Total_Valid_Steps, Hidden]
+                active_pos_items = pos_items[mask] # [Total_Valid_Steps]
+                
                 n_neg = self.sample_num
-                batch_size = pos_items.size(0)
+                
+                # A. Positive Scores
+                pos_emb = self.item_embedding(active_pos_items)
+                pos_logits = torch.sum(active_output * pos_emb, dim=-1, keepdim=True) # [N, 1]
 
-                # A. Calculate Positive Scores (Cheap)
-                pos_emb = self.item_embedding(pos_items)
-                # Dot Product: [Batch, H] * [Batch, H] -> Sum -> [Batch, 1]
-                pos_logits = torch.sum(seq_output * pos_emb, dim=-1, keepdim=True)
-
-                # B. Calculate Negative Scores (Heavy - Optimized)
-                # Generate Negatives on GPU (SHARED NEGATIVES)
-                # We sample one set of negatives for the whole batch.
-                # This allows using a single GEMM (MatMul) which is much faster than BMM.
+                # B. Negative Scores (Shared Negatives for Efficiency)
+                # Sample negatives once for the whole flattened batch
                 neg_items = torch.randint(
-                    1, self.n_items,
-                    (n_neg,),
-                    device=pos_items.device
+                    1, self.n_items, 
+                    (n_neg,), 
+                    device=active_pos_items.device
                 )
-                neg_emb = self.item_embedding(neg_items)  # [Neg, Hidden]
-
-                # USE TENSOR CORES: General Matrix Multiplication (GEMM)
-                # [Batch, Hidden] @ [Hidden, Neg] -> [Batch, Neg]
-                neg_logits = torch.matmul(seq_output, neg_emb.transpose(0, 1))
-
-                # 3. Combine Scores: [Batch, 1] + [Batch, Neg] -> [Batch, 1+Neg]
-                logits = torch.cat([pos_logits, neg_logits], dim=1)
-
-                # 4. Target is always index 0
+                neg_emb = self.item_embedding(neg_items) # [Neg, Hidden]
+                
+                # GEMM: [N, Hidden] @ [Hidden, Neg] -> [N, Neg]
+                neg_logits = torch.matmul(active_output, neg_emb.transpose(0, 1))
+                
+                # Combine
+                logits = torch.cat([pos_logits, neg_logits], dim=1) # [N, 1+Neg]
+                
+                # Target is index 0
                 targets = torch.zeros(
-                    batch_size, dtype=torch.long, device=pos_items.device
+                    logits.size(0), dtype=torch.long, device=active_pos_items.device
                 )
+                
+                return self.loss_fct(logits, targets)
 
-                loss = self.loss_fct(logits, targets)
-                return loss
             else:
+                # Original CE implementation (Full Softmax)
+                # It usually calculates loss on all positions
                 test_item_emb = self.item_embedding.weight
-                logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
-                loss = self.loss_fct(logits, pos_items)
+                
+                # Flatten
+                active_output = seq_output[mask]
+                active_pos_items = pos_items[mask]
+                
+                logits = torch.matmul(active_output, test_item_emb.transpose(0, 1))
+                loss = self.loss_fct(logits, active_pos_items)
                 return loss
 
     def predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         test_item = interaction[self.ITEM_ID]
+        
+        # Predict uses the LAST item in the sequence
         seq_output = self.forward(item_seq, item_seq_len)
+        
+        # Gather last
+        batch_indices = torch.arange(seq_output.size(0), device=seq_output.device)
+        seq_output = seq_output[batch_indices, item_seq_len - 1]
+            
         test_item_emb = self.item_embedding(test_item)
         scores = torch.mul(seq_output, test_item_emb).sum(dim=1)  # [B]
         return scores
@@ -221,7 +250,13 @@ class SASRec(SequentialRecommender):
     def full_sort_predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        
         seq_output = self.forward(item_seq, item_seq_len)
+        
+        # Gather last
+        batch_indices = torch.arange(seq_output.size(0), device=seq_output.device)
+        seq_output = seq_output[batch_indices, item_seq_len - 1]
+        
         test_items_emb = self.item_embedding.weight
         scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B n_items]
         return scores
