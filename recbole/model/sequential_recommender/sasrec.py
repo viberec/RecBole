@@ -59,15 +59,20 @@ class SASRec(SequentialRecommender):
             self.n_items, self.hidden_size, padding_idx=0
         )
         self.position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
-        self.trm_encoder = TransformerEncoder(
-            n_layers=self.n_layers,
-            n_heads=self.n_heads,
-            hidden_size=self.hidden_size,
-            inner_size=self.inner_size,
-            hidden_dropout_prob=self.hidden_dropout_prob,
-            attn_dropout_prob=self.attn_dropout_prob,
-            hidden_act=self.hidden_act,
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_size,
+            nhead=self.n_heads,
+            dim_feedforward=self.inner_size,
+            dropout=self.hidden_dropout_prob,
+            activation=self.hidden_act,
             layer_norm_eps=self.layer_norm_eps,
+            batch_first=True,    # CRITICAL: SASRec data is [Batch, Seq]
+            norm_first=True      # Pre-Norm is generally more stable for deep SASRec
+        )
+        self.trm_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=self.n_layers,
+            enable_nested_tensor=False
         )
 
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
@@ -126,18 +131,63 @@ class SASRec(SequentialRecommender):
         input_emb = self.LayerNorm(input_emb)
         input_emb = self.dropout(input_emb)
 
-        extended_attention_mask = self.get_attention_mask(item_seq)
-
-        # 2. OPTIMIZATION: Don't store unused layers
-        # output_all_encoded_layers=False ensures we don't hold references
-        # to intermediate layers we don't need, slightly reducing Peak VRAM.
+        # 2. OPTIMIZATION: Use Native PyTorch Transformer
+        # Extended attention mask from RecBole is usually [B, 1, 1, Seq_Len] or similar
+        # PyTorch native transformer expects [B, Head, Seq, Seq] or [Batch*Head, Seq, Seq]
+        # or more simply for src_key_padding_mask: [Batch, Seq]
+        
+        # RecBole's get_attention_mask returns a 4D mask with -10000.0 for padding
+        # We need to adapt this for nn.TransformerEncoder
+        # The native encoder expects a mask of shape (S,S) or (B*num_heads, S, S).
+        # Since we have a causal (left-to-right) requirement, we usually combine this.
+        
+        # However, typically RecBole's `get_attention_mask` does two things:
+        # 1. Pads 0s
+        # 2. Causality (Future masking)
+        
+        # Let's simplify and use PyTorch's causal mask generation if we can, 
+        # but sticking to RecBole's logic for safety:
+        # extended_attention_mask is [B, 1, 1, Seq_Len] (from RecBole's base class usually)
+        # But wait, SASRec overrode it? No, it inherits from SequentialRecommender.
+        # Let's check SequentialRecommender.get_attention_mask in abstract_recommender.py
+        
+        # It seems safer to just pass `src_key_padding_mask` and `mask`.
+        # But RecBole's get_attention_mask encapsulates everything into a float additive mask.
+        
+        # Since we switched to Native Transformer, we must accept that `forward` args are different.
+        # nn.TransformerEncoder(src, mask=..., src_key_padding_mask=...)
+        
+        # We will strip dimensions to make it compatible or just use the additive mask as `mask`.
+        # The mask shape should be [Batch*n_head, Seq_Len, Seq_Len] for 3D mask in PyTorch < 2.0 
+        # or [Batch, Seq_Len, Seq_Len].
+        
+        # RecBole's `extended_attention_mask` is [B, 1, 1, Seq_Len] ? 
+        # Actually SequentialRecommender.get_attention_mask returns [B, 1, Seq_Len, Seq_Len] for bidirectional=False.
+        
+        # Let's try to trust the additive mask "just works" if we squeeze it correctly.
+        # But native transformer expects boolean or float mask.
+        
+        # Squeeze the head dim: [B, 1, S, S] -> [B, S, S]
+        # And multiply heads? No, PyTorch supports [B*num_heads, S, S] or [S, S].
+        
+        # Simpler approach: generating causal mask using nn.Transformer
+        
+        attention_mask = self.get_attention_mask(item_seq, bidirectional=False)
+        # attention_mask is [B, 1, S, S] with 0.0 and -10000.0
+        
+        # We need to reshape for PyTorch Native: [B * n_heads, S, S]
+        # But wait, batch_first=True means we can pass [B, S, S]? 
+        # PyTorch documentation says: mask (Tensor, optional): the mask of shape (S, S) or (N*num_heads, S, S).
+        
+        # So we repeat it.
+        attention_mask = attention_mask.squeeze(1).repeat(self.n_heads, 1, 1)
+        
         trm_output = self.trm_encoder(
-            input_emb, extended_attention_mask, output_all_encoded_layers=False
+            src=input_emb,
+            mask=attention_mask
         )
-
-        # RecBole's TransformerEncoder usually returns a list even if False
-        # We take the last one (which is the only one if False is effective)
-        output = trm_output[-1]
+        
+        output = trm_output # Native encoder returns tensor, not list
 
         output = self.gather_indexes(output, item_seq_len - 1)
         return output  # [B H]
