@@ -134,28 +134,30 @@ class SASRec(SequentialRecommender):
                 n_neg = self.sample_num
                 batch_size = pos_items.size(0)
 
-                # 1. GENERATE ON GPU: Instant random integers
-                # We sample from [1, n_items). Index 0 is padding.
-                # This avoids all CPU-to-GPU copy overhead.
+                # A. Calculate Positive Scores (Cheap)
+                pos_emb = self.item_embedding(pos_items)
+                # Dot Product: [Batch, H] * [Batch, H] -> Sum -> [Batch, 1]
+                pos_logits = torch.sum(seq_output * pos_emb, dim=-1, keepdim=True)
+
+                # B. Calculate Negative Scores (Heavy - Optimized)
+                # Generate Negatives on GPU
                 neg_items = torch.randint(
                     1, self.n_items,
                     (batch_size, n_neg),
                     device=pos_items.device
                 )
+                neg_emb = self.item_embedding(neg_items)
 
-                # 2. Combine Positive (1) + Negatives (N) -> Candidates (N+1)
-                pos_items_unsqueeze = pos_items.unsqueeze(1)
-                candidates = torch.cat([pos_items_unsqueeze, neg_items], dim=1)
+                # USE TENSOR CORES: Batch Matrix Multiplication (BMM)
+                # Reshape seq_output to [Batch, Hidden, 1]
+                # [Batch, Neg, Hidden] @ [Batch, Hidden, 1] -> [Batch, Neg, 1]
+                # This is significantly faster than broadcast mul + sum on L4
+                neg_logits = torch.bmm(neg_emb, seq_output.unsqueeze(2)).squeeze(2)
 
-                # 3. Get embeddings for just these candidates
-                candidate_emb = self.item_embedding(candidates)  # [Batch, N+1, Hidden]
+                # 3. Combine Scores: [Batch, 1] + [Batch, Neg] -> [Batch, 1+Neg]
+                logits = torch.cat([pos_logits, neg_logits], dim=1)
 
-                # 4. Calculate logits (Dot Product)
-                seq_output_unsqueeze = seq_output.unsqueeze(1)
-                # [Batch, 1, Hidden] * [Batch, N+1, Hidden] -> Sum -> [Batch, N+1]
-                logits = (seq_output_unsqueeze * candidate_emb).sum(dim=-1)
-
-                # 5. Target is always index 0 (The Positive Item)
+                # 4. Target is always index 0
                 targets = torch.zeros(
                     batch_size, dtype=torch.long, device=pos_items.device
                 )
