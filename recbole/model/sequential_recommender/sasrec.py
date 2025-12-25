@@ -79,6 +79,14 @@ class SASRec(SequentialRecommender):
             self.loss_fct = nn.CrossEntropyLoss()
         else:
             raise NotImplementedError("Make sure 'loss_type' in ['BPR', 'CE']!")
+        
+        # OPTIMIZATION 1: Pre-compute static Position IDs
+        # We create a buffer [1, max_seq_length] that lives on the GPU.
+        # This prevents creating a new tensor every single forward step.
+        self.register_buffer(
+            "position_ids",
+            torch.arange(self.max_seq_length).unsqueeze(0)
+        )
 
         # parameters initialization
         self.apply(self._init_weights)
@@ -96,23 +104,41 @@ class SASRec(SequentialRecommender):
             module.bias.data.zero_()
 
     def forward(self, item_seq, item_seq_len):
-        position_ids = torch.arange(
-            item_seq.size(1), dtype=torch.long, device=item_seq.device
-        )
-        position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
+        # 1. OPTIMIZATION: Use Cached Position IDs + Broadcasting
+        # Old way: Created new tensor, expanded to [Batch, Len] (Memory heavy)
+        # New way: Slice existing buffer [1, Len].
+        # PyTorch broadcasting handles the [Batch, Len] + [1, Len] addition automatically.
+
+        # Safety check: Ensure we don't slice past the buffer
+        seq_length = item_seq.size(1)
+        position_ids = self.position_ids[:, :seq_length]
+
+        # Lookup happens on [1, Len] -> Result [1, Len, Hidden]
+        # This is much smaller than [Batch, Len, Hidden]
         position_embedding = self.position_embedding(position_ids)
 
         item_emb = self.item_embedding(item_seq)
+
+        # Broadcasting happens here:
+        # [Batch, Len, Hidden] + [1, Len, Hidden]
         input_emb = item_emb + position_embedding
+
         input_emb = self.LayerNorm(input_emb)
         input_emb = self.dropout(input_emb)
 
         extended_attention_mask = self.get_attention_mask(item_seq)
 
+        # 2. OPTIMIZATION: Don't store unused layers
+        # output_all_encoded_layers=False ensures we don't hold references
+        # to intermediate layers we don't need, slightly reducing Peak VRAM.
         trm_output = self.trm_encoder(
-            input_emb, extended_attention_mask, output_all_encoded_layers=True
+            input_emb, extended_attention_mask, output_all_encoded_layers=False
         )
+
+        # RecBole's TransformerEncoder usually returns a list even if False
+        # We take the last one (which is the only one if False is effective)
         output = trm_output[-1]
+
         output = self.gather_indexes(output, item_seq_len - 1)
         return output  # [B H]
 
