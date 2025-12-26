@@ -184,11 +184,13 @@ def data_preparation(config, dataset):
                 config, train_dataset, train_sampler, kg_sampler, shuffle=True
             )
 
+        eval_config = copy.copy(config)
+        eval_config["worker"] = 0
         valid_data = get_dataloader(config, "valid")(
-            config, valid_dataset, valid_sampler, shuffle=False
+            eval_config, valid_dataset, valid_sampler, shuffle=False
         )
         test_data = get_dataloader(config, "test")(
-            config, test_dataset, test_sampler, shuffle=False
+            eval_config, test_dataset, test_sampler, shuffle=False
         )
         if config["save_dataloaders"]:
             save_split_dataloaders(
