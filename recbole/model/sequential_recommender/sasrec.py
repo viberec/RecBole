@@ -50,6 +50,8 @@ class SASRec(SequentialRecommender):
 
         self.initializer_range = config["initializer_range"]
         self.loss_type = config["loss_type"]
+        # Default to True to optimize VRAM scaling unless explicitly disabled
+        self.gradient_checkpointing = config["gradient_checkpointing"] if "gradient_checkpointing" in config else True
 
         # define layers and loss
         self.item_embedding = nn.Embedding(
@@ -113,11 +115,23 @@ class SASRec(SequentialRecommender):
         # Padding mask: [batch_size, seq_len]
         src_key_padding_mask = (item_seq == 0)
 
-        output = self.trm_encoder(
-            input_emb,
-            mask=src_mask,
-            src_key_padding_mask=src_key_padding_mask,
-        )
+        if self.gradient_checkpointing and self.training:
+            output = input_emb
+            for layer in self.trm_encoder.layers:
+                output = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    output,
+                    src_mask,
+                    src_key_padding_mask,
+                    use_reentrant=False
+                )
+        else:
+            output = self.trm_encoder(
+                input_emb,
+                mask=src_mask,
+                src_key_padding_mask=src_key_padding_mask,
+            )
+            
         output = self.gather_indexes(output, item_seq_len - 1)
         return output  # [B H]
 
